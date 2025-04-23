@@ -1,0 +1,28 @@
+{
+  "tables": [
+    {
+      "name": "books",
+      "columns": [
+        { "name": "books_id", "type": "integer", "constraint": "PRIMARY KEY" },
+        { "name": "title", "type": "text", "constraint": null },
+        { "name": "publish_year", "type": "integer", "constraint": null },
+        { "name": "authors_id", "type": "integer", "constraint": "FOREIGN KEY" }
+      ]
+    },
+    {
+      "name": "authors",
+      "columns": [
+        { "name": "author_id", "type": "integer", "constraint": "PK" },
+        { "name": "name", "type": "text", "constraint": null },
+        { "name": "birth_year", "type": "integer", "constraint": null }
+      ]
+    },
+    {
+      "name": "book_authors",
+      "columns": [
+        { "name": "book_id", "type": "integer", "constraint": "FK" },
+        { "name": "author_id", "type": "integer", "constraint": "FK" }
+      ]
+    }
+  ]
+}
