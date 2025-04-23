@@ -12,8 +12,25 @@ DB_CONFIG = {
 INPUT_FILE = "input.json"
 OUTPUT_FILE = "output.json"
 
+# Группы совместимых типов
+TYPE_GROUPS = {
+    "int": ["int2", "int4", "int8", "integer", "smallint", "bigint", "serial", "bigserial"],
+    "string": ["varchar", "text", "char", "character varying", "bpchar"],
+    "double": ["double precision", "float8", "real", "float4", "numeric", "decimal"]
+}
+
 def is_valid_name(name):
     return bool(re.match(r"^[a-z][a-z0-9_]*$", name))
+
+def is_type_compatible(expected, actual):
+    expected = expected.lower()
+    actual = actual.lower()
+    if expected == actual:
+        return True
+    for group, aliases in TYPE_GROUPS.items():
+        if expected == group and any(alias in actual for alias in aliases):
+            return True
+    return False
 
 def get_db_schema(cursor):
     cursor.execute("""
@@ -82,14 +99,18 @@ def check_database_rules(input_json):
             else:
                 actual_type = schema_map[(tname, cname)]
                 expected_type = column.get('type')
-                if expected_type and actual_type != expected_type:
-                    column['errors'].append(f"Тип не совпадает: в БД '{actual_type}', ожидался '{expected_type}'")
+                if expected_type and not is_type_compatible(expected_type, actual_type):
+                    column['errors'].append(
+                        f"Тип не совпадает: в БД '{actual_type}', ожидался '{expected_type}' (гибкая проверка)"
+                    )
                 column['actual_type'] = actual_type
 
             actual_constraint = constraint_map.get((tname, cname))
             expected_constraint = column.get('constraint')
             if expected_constraint and actual_constraint != expected_constraint:
-                column['errors'].append(f"Ограничение не совпадает: в БД '{actual_constraint}', ожидалось '{expected_constraint}'")
+                column['errors'].append(
+                    f"Ограничение не совпадает: в БД '{actual_constraint}', ожидалось '{expected_constraint}'"
+                )
             column['actual_constraint'] = actual_constraint
 
     cursor.close()
