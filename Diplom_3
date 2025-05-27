@@ -1,0 +1,284 @@
+import json
+import psycopg2
+import re
+from datetime import datetime
+
+CONFIG_FILE = "config.json"
+INPUT_FILE = "input.json"
+OUTPUT_FILE = "output.json"
+ERROR_FILE = "errors.json"
+
+TYPE_GROUPS = {
+    "int": ["int2", "int4", "int8", "integer", "smallint", "bigint", "serial", "bigserial"],
+    "string": ["varchar", "text", "char", "character varying", "bpchar"],
+    "double": ["double precision", "float8", "real", "float4", "numeric", "decimal"],
+    "date": ["date"]
+}
+
+def is_valid_name(name):
+    return bool(re.match(r"^[a-z][a-z0-9_]*$", name))
+
+def execute_query(cursor, query, params=None):
+    try:
+        cursor.execute(query, params)
+    except psycopg2.Error as e:
+        cursor.connection.rollback()
+        raise e
+
+def get_db_schema(cursor):
+    cursor.execute("""
+        SELECT table_name, column_name, data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public';
+    """)
+    return cursor.fetchall()
+
+def get_constraints(cursor):
+    cursor.execute("""
+        SELECT 
+            tc.table_name, 
+            kcu.column_name, 
+            tc.constraint_type,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+            ON tc.constraint_name = kcu.constraint_name
+        LEFT JOIN information_schema.constraint_column_usage AS ccu
+            ON tc.constraint_name = ccu.constraint_name
+        WHERE tc.table_schema = 'public';
+    """)
+    return cursor.fetchall()
+
+def get_primary_keys(cursor):
+    cursor.execute("""
+        SELECT tc.table_name, kcu.column_name
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+          ON tc.constraint_name = kcu.constraint_name
+        WHERE tc.table_schema = 'public' AND tc.constraint_type = 'PRIMARY KEY';
+    """)
+    pk_map = {}
+    for table, column in cursor.fetchall():
+        pk_map.setdefault(table, []).append(column)
+    return pk_map
+
+def get_row_counts(cursor, table_names):
+    counts = {}
+    for table in table_names:
+        try:
+            cursor.execute(f'SELECT COUNT(*) FROM "{table}";')
+            counts[table] = cursor.fetchone()[0]
+        except Exception as e:
+            counts[table] = f"Ошибка доступа к таблице: {str(e)}"
+    return counts
+
+def get_default_value(data_type):
+    if data_type in TYPE_GROUPS['string']:
+        return "'Test'"
+    elif data_type in TYPE_GROUPS['int']:
+        return "0"
+    elif data_type in TYPE_GROUPS['double']:
+        return "1.0"
+    elif data_type in TYPE_GROUPS['date']:
+        return f"'{datetime.now().date().isoformat()}'"
+    return "NULL"
+
+def format_value_for_type(val, data_type):
+    if data_type in TYPE_GROUPS['string']:
+        return f"'{val}'"
+    elif data_type in TYPE_GROUPS['int']:
+        return str(int(val))
+    elif data_type in TYPE_GROUPS['double']:
+        return str(float(val))
+    elif data_type in TYPE_GROUPS['date']:
+        if val == "current_date":
+            return f"'{datetime.now().date().isoformat()}'"
+        else:
+            return f"'{val}'"
+    return "NULL"
+
+def check_check_constraints(cursor, table, schema_by_table):
+    table_name = table["name"]
+    errors = []
+
+    checks = table.get("check", [])
+    columns = {col['name']: col for col in table.get("columns", [])}
+    all_schema = schema_by_table.get(table_name, {})
+
+    for check in checks:
+        for check_name, conditions in check.items():
+            for cond in conditions:
+                col = cond['column']
+                ap = cond['ap']
+                val = cond['value']
+
+                data_type = all_schema[col]['type'] if col in all_schema else 'text'
+                val_valid = get_default_value(data_type)
+                val_invalid = format_value_for_type(val, data_type)
+
+
+                # Собираем значения для вставки
+                test_columns = []
+                test_values_valid = []
+                test_values_invalid = []
+                for cname, cdef in all_schema.items():
+                    test_columns.append(cname)
+                    if cname == col:
+                        test_values_valid.append(val_valid)
+                        test_values_invalid.append(val_invalid)
+                    else:
+                        test_values_valid.append(get_default_value(cdef['type']))
+                        test_values_invalid.append(get_default_value(cdef['type']))
+
+                columns_sql = ", ".join(test_columns)
+                valid_sql = ", ".join(test_values_valid)
+                invalid_sql = ", ".join(test_values_invalid)
+
+                # Проверка валидной вставки
+                try:
+                    cursor.execute(f"INSERT INTO {table_name} ({columns_sql}) VALUES ({valid_sql});")
+                    cursor.connection.commit()
+                    errors.append(
+                        f"CHECK {check_name}: ✅ валидная вставка прошла. Вставлялось: ({valid_sql})"
+                    )
+                except Exception as e:
+                    errors.append(
+                        f"CHECK {check_name}: ❌ ошибка на валидной вставке ({valid_sql}): {str(e)}"
+                    )
+                    cursor.connection.rollback()
+
+                # Проверка невалидной вставки
+                try:
+                    cursor.execute(f"INSERT INTO {table_name} ({columns_sql}) VALUES ({invalid_sql});")
+                    cursor.connection.commit()
+                    errors.append(
+                        f"CHECK {check_name}: ❌ невалидная вставка прошла (должна была отклониться). Вставлялось: ({invalid_sql})"
+                    )
+                except:
+                    errors.append(
+                        f"CHECK {check_name}: ✅ невалидная вставка отклонена. Пытались вставить: ({invalid_sql})"
+                    )
+                    cursor.connection.rollback()
+
+                # Удаление тестовых строк
+                try:
+                    cursor.execute(f"DELETE FROM {table_name} WHERE {col} = {val_valid} OR {col} = {val_invalid};")
+                    cursor.connection.commit()
+                except:
+                    cursor.connection.rollback()
+
+    return errors
+
+def check_database_rules(config, input_json):
+    conn = psycopg2.connect(**config)
+    cursor = conn.cursor()
+
+    try:
+        db_schema = get_db_schema(cursor)
+        constraints = get_constraints(cursor)
+        pk_map = get_primary_keys(cursor)
+        row_counts = get_row_counts(cursor, [t['name'] for t in input_json['tables']])
+
+        schema_by_table = {}
+        for t, c, tpe, nullability in db_schema:
+            schema_by_table.setdefault(t, {})[c] = {"type": tpe, "nullable": nullability == "YES"}
+
+        constraint_map = {}
+        foreign_keys = {}
+
+        for table, column, ctype, f_table, f_column in constraints:
+            constraint_map[(table, column)] = ctype
+            if ctype == "FOREIGN KEY":
+                foreign_keys[(table, column)] = {"table": f_table, "column": f_column}
+
+        for table in input_json['tables']:
+            tname = table['name']
+            table['errors'] = []
+            table['row_count'] = row_counts.get(tname, "Неизвестно")
+
+            expected_pk = set(table.get('PK', []))
+            actual_pk = set(pk_map.get(tname, []))
+            if expected_pk != actual_pk:
+                table['errors'].append(f"PK не совпадает: в БД {sorted(actual_pk)}, ожидалось {sorted(expected_pk)}")
+
+            for column in table.get('columns', []):
+                cname = column['name']
+                column['errors'] = []
+
+                if not is_valid_name(cname):
+                    column['errors'].append(f"Неверное имя столбца '{cname}'")
+
+                if cname not in schema_by_table.get(tname, {}):
+                    column['errors'].append("Столбец не найден в БД")
+                    continue
+
+                actual_type = schema_by_table[tname][cname]['type']
+                expected_type = column.get('type')
+                column['actual_type'] = actual_type
+
+                if expected_type and actual_type not in TYPE_GROUPS.get(expected_type, [expected_type]):
+                    column['errors'].append(f"Тип не совпадает: в БД '{actual_type}', ожидался '{expected_type}'")
+
+                expected_constraint = column.get('constraint')
+                actual_constraint = constraint_map.get((tname, cname))
+
+                if expected_constraint == 'NOT NULL':
+                    if schema_by_table[tname][cname]['nullable']:
+                        column['errors'].append(f"Ограничение не совпадает: ожидалось 'NOT NULL', в БД нет ограничения")
+                elif expected_constraint:
+                    if actual_constraint != expected_constraint:
+                        column['errors'].append(f"Ограничение не совпадает: в БД '{actual_constraint}', ожидалось '{expected_constraint}'")
+
+                # Проверка FOREIGN KEY
+                if "FK" in column:
+                    expected_fk = column["FK"]
+                    actual_fk = foreign_keys.get((tname, cname))
+                    if not actual_fk:
+                        column['errors'].append(f"Нет внешнего ключа: ожидался FOREIGN KEY на {expected_fk}")
+                    elif actual_fk != expected_fk:
+                        column['errors'].append(
+                            f"FOREIGN KEY не совпадает: в БД → {actual_fk}, ожидалось → {expected_fk}"
+                        )
+
+            table['check_tests'] = check_check_constraints(cursor, table, schema_by_table)
+
+    except Exception as e:
+        print(f"Ошибка в процессе проверки БД: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+    return input_json
+
+def collect_errors(data):
+    errors = []
+    for table in data.get("tables", []):
+        tname = table["name"]
+        for err in table.get("errors", []):
+            errors.append(f"[Таблица {tname}] {err}")
+        for col in table.get("columns", []):
+            cname = col["name"]
+            for cerr in col.get("errors", []):
+                errors.append(f"[Таблица {tname} → Столбец {cname}] {cerr}")
+        for check_err in table.get("check_tests", []):
+            errors.append(f"[Таблица {tname} → CHECK] {check_err}")
+    return errors
+
+if __name__ == "__main__":
+    with open(CONFIG_FILE, "r", encoding="utf-8") as conf_file:
+        db_config = json.load(conf_file)
+
+    with open(INPUT_FILE, "r", encoding="utf-8") as infile:
+        input_data = json.load(infile)
+
+    result = check_database_rules(db_config, input_data)
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as outfile:
+        json.dump(result, outfile, indent=2, ensure_ascii=False)
+
+    errors = collect_errors(result)
+    with open(ERROR_FILE, "w", encoding="utf-8") as errfile:
+        json.dump(errors, errfile, indent=2, ensure_ascii=False)
+
+    print(f"✅ Проверка завершена. Результаты в '{OUTPUT_FILE}', ошибки в '{ERROR_FILE}'")

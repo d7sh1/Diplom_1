@@ -3,26 +3,94 @@
     {
       "name": "books",
       "columns": [
-        { "name": "books_id", "type": "int", "constraint": "PRIMARY KEY" },
-        { "name": "title", "type": "string", "constraint": null },
-        { "name": "publish_year", "type": "integer", "constraint": null },
-        { "name": "authors_id", "type": "integer", "constraint": "FOREIGN KEY" }
+        {
+          "name": "books_id",
+          "type": "int",
+          "constraint": "NOT NULL"
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "constraint": "NOT NULL"
+        },
+        {
+          "name": "authors_id",
+          "type": "int",
+          "constraint": "NOT NULL"
+        }
+      ],
+      "PK": ["books_id"],
+      "check": [
+        {
+          "valid_title": [
+            {
+              "ap": "!=",
+              "value": "''",
+              "column": "title"
+            }
+          ]
+        }
       ]
     },
     {
       "name": "authors",
       "columns": [
-        { "name": "authors_id", "type": "integer", "constraint": "PK" },
-        { "name": "name", "type": "text", "constraint": null },
-        { "name": "birth_year", "type": "integer", "constraint": null }
+        {
+          "name": "authors_id",
+          "type": "int",
+          "constraint": "NOT NULL"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "constraint": "NOT NULL"
+        },
+        {
+          "name": "family",
+          "type": "string",
+          "constraint": "NOT NULL"
+        },
+        {
+          "name": "birthday",
+          "type": "date"
+        }
+      ],
+      "PK": ["authors_id"],
+      "check": [
+        {
+          "valid_birthday": [
+            {
+              "ap": "<=",
+              "value": "current_date",
+              "column": "birthday"
+            }
+          ]
+        }
       ]
     },
     {
-      "name": "book_authors",
+      "name": "book_author",
       "columns": [
-        { "name": "book_id", "type": "integer", "constraint": "FK" },
-        { "name": "author_id", "type": "integer", "constraint": "FK" }
-      ]
+        {
+          "name": "book_id",
+          "type": "int",
+          "constraint": "NOT NULL",
+          "FK": {
+            "table": "books",
+            "column": "books_id"
+          }
+        },
+        {
+          "name": "author_id",
+          "type": "int",
+          "constraint": "NOT NULL",
+          "FK": {
+            "table": "authors",
+            "column": "authors_id"
+          }
+        }
+      ],
+      "PK": ["book_id"]
     }
   ]
 }
